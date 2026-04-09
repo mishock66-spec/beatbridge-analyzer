@@ -4,12 +4,13 @@ const { chromium } = require("playwright");
 const Anthropic = require("@anthropic-ai/sdk");
 const Airtable = require("airtable");
 
-const MIN_DELAY_MS = 3000;
-const MAX_DELAY_MS = 8000;
+const MIN_DELAY_MS = 8000;   // increased from 3s
+const MAX_DELAY_MS = 15000;  // increased from 8s
 const PAUSE_EVERY = 15;
 const PAUSE_MS = 5 * 60 * 1000;
-const RATE_LIMIT_COOLDOWN_MS = 30 * 1000; // wait 30s then continue
-const MAX_CONSECUTIVE_RATE_LIMITS = 3;    // stop session after 3 in a row
+const RATE_LIMIT_COOLDOWN_MS = 30 * 1000;
+const MAX_CONSECUTIVE_RATE_LIMITS = 3;
+const INITIAL_WARMUP_MS = 5000; // wait before first profile
 
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || "appW42oNhB9Hl14bq";
 const AIRTABLE_TABLE_ID = process.env.AIRTABLE_TABLE_ID || "tbl0nVXbK5BQnU5FM";
@@ -47,6 +48,32 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Simulate brief human-like mouse movement
+async function humanMouseMove(page) {
+  try {
+    await page.mouse.move(
+      100 + Math.random() * 500,
+      100 + Math.random() * 400
+    );
+  } catch {
+    // non-fatal
+  }
+}
+
+// Visit Instagram homepage to warm up / reset session state
+async function visitHomepage(page) {
+  try {
+    await page.goto("https://www.instagram.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
+    });
+    await sleep(2000);
+    await humanMouseMove(page);
+  } catch {
+    // non-fatal — continue even if homepage load fails
+  }
+}
+
 // ── Scrape ────────────────────────────────────────────────────────────────────
 
 async function scrapeProfile(page, username) {
@@ -55,16 +82,17 @@ async function scrapeProfile(page, username) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // Wait for network to settle — catches lazy-loaded content
+    // Wait for network to settle
     try {
       await page.waitForLoadState("networkidle", { timeout: 15000 });
     } catch {
-      // networkidle timeout is non-fatal — just proceed
+      // non-fatal
     }
+
+    await humanMouseMove(page);
 
     const current = page.url();
 
-    // Rate-limit / challenge signals
     if (
       current.includes("/accounts/login") ||
       current.includes("/challenge") ||
@@ -74,7 +102,6 @@ async function scrapeProfile(page, username) {
       throw new Error("RATE_LIMIT");
     }
 
-    // Check body text for block indicators
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
     if (
       bodyText.includes("We restrict certain activity") ||
@@ -94,7 +121,7 @@ async function scrapeProfile(page, username) {
       };
     }
 
-    // ── Strategy 1: JSON-LD structured data ──────────────────────────────────
+    // Strategy 1: JSON-LD
     const jsonLdData = await page.evaluate(() => {
       const scripts = [...document.querySelectorAll('script[type="application/ld+json"]')];
       for (const s of scripts) {
@@ -105,24 +132,20 @@ async function scrapeProfile(page, username) {
             const profile = d.find((e) => e["@type"] === "ProfilePage" || e.mainEntity);
             if (profile) return profile;
           }
-        } catch { /* skip malformed */ }
+        } catch { /* skip */ }
       }
       return null;
     });
 
-    // ── Strategy 2: meta[name="description"] — usually has followers + bio ───
+    // Strategy 2: meta description
     const metaDesc = await page.evaluate(
       () => document.querySelector('meta[name="description"]')?.content || ""
     );
 
-    // Parse bio from meta description
-    // Format: "X Followers, Y Following, Z Posts - See Instagram photos..."
-    // or:     "X Followers, Y Following, Z Posts - username: bio text here"
     let bioFromMeta = "";
     const metaBioMatch = metaDesc.match(/\d+[^\-]+-\s*[^:]+:\s*(.+)/);
     if (metaBioMatch) bioFromMeta = metaBioMatch[1].trim();
 
-    // Parse follower counts from meta description
     let followersFromMeta = "", followingFromMeta = "", postsFromMeta = "";
     const fm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Follower/i);
     const fgm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Following/i);
@@ -131,16 +154,14 @@ async function scrapeProfile(page, username) {
     if (fgm) followingFromMeta = fgm[1];
     if (pm) postsFromMeta = pm[1];
 
-    // ── Strategy 3: DOM extraction ────────────────────────────────────────────
+    // Strategy 3: DOM
     const domData = await page.evaluate(() => {
       let bio = "";
       const bioSelectors = [
-        // Modern Instagram bio span
         "header section h1 ~ div span",
         "header section > div:last-child span",
         "header section > div > span",
         "header section span[class]",
-        // Fallback: any non-stat span in header
         "header span",
       ];
       for (const sel of bioSelectors) {
@@ -162,11 +183,8 @@ async function scrapeProfile(page, username) {
         if (bio) break;
       }
 
-      // Stats from <ul> in header
       let followers = "", following = "", posts = "";
-      const liEls = [
-        ...document.querySelectorAll("header ul li, header section ul li, header section li"),
-      ];
+      const liEls = [...document.querySelectorAll("header ul li, header section ul li, header section li")];
       for (const li of liEls) {
         const raw = li.innerText.replace(/\s+/g, " ").trim();
         if (/follower/i.test(raw) && !/following/i.test(raw)) {
@@ -181,17 +199,13 @@ async function scrapeProfile(page, username) {
         }
       }
 
-      // Full name from header
       const nameEl =
         document.querySelector("header h2") ||
         document.querySelector("header h1") ||
         document.querySelector("header section > div:first-child span");
       const fullName = nameEl?.innerText?.trim() || "";
 
-      // Post captions from img alt attributes
-      const postImgs = [
-        ...document.querySelectorAll("article img[alt], main img[alt]"),
-      ].slice(0, 12);
+      const postImgs = [...document.querySelectorAll("article img[alt], main img[alt]")].slice(0, 12);
       const postCaptions = postImgs
         .map((img) => img.alt?.trim())
         .filter((t) => t && t.length > 5);
@@ -199,21 +213,13 @@ async function scrapeProfile(page, username) {
       return { bio, followers, following, posts, fullName, postCaptions };
     });
 
-    // Merge strategies: DOM > meta fallbacks
-    const bio = domData.bio || bioFromMeta;
-    const followers = domData.followers || followersFromMeta;
-    const following = domData.following || followingFromMeta;
-    const posts = domData.posts || postsFromMeta;
-    const fullName = domData.fullName ||
-      (jsonLdData?.mainEntity?.name) || "";
-
     return {
-      bio,
+      bio: domData.bio || bioFromMeta,
       metaDesc,
-      followers,
-      following,
-      posts,
-      fullName,
+      followers: domData.followers || followersFromMeta,
+      following: domData.following || followingFromMeta,
+      posts: domData.posts || postsFromMeta,
+      fullName: domData.fullName || (jsonLdData?.mainEntity?.name) || "",
       postCaptions: domData.postCaptions,
     };
 
@@ -257,29 +263,24 @@ async function analyzeWithClaude(client, contact, profileData) {
 }
 
 // ── Airtable update ───────────────────────────────────────────────────────────
+// Use field IDs to avoid name-mismatch errors.
+// Field IDs (table tbl0nVXbK5BQnU5FM):
+//   template       → fldy8ho1lxBh8iB3n
+//   Type de profil → fld8dCqjrnqCsRSog
+//   Notes          → fldpLozVCrvYj62i0
 
 async function updateAirtable(base, recordId, analysis, existingBio) {
   const newBio = existingBio
     ? `${existingBio}\n— Analysis: ${analysis.analysis_note}`
     : `— Analysis: ${analysis.analysis_note}`;
 
-  const fields = {
-    template: analysis.template,
-    "Type de profil": analysis.profile_type,
-    Notes: newBio,
-    analyzed: true,
-  };
+  const fields = {};
+  if (analysis.template)    fields["fldy8ho1lxBh8iB3n"] = analysis.template;
+  if (analysis.profile_type) fields["fld8dCqjrnqCsRSog"] = analysis.profile_type;
+  fields["fldpLozVCrvYj62i0"] = newBio;
 
-  try {
-    await base(AIRTABLE_TABLE_ID).update([{ id: recordId, fields }]);
-  } catch (err) {
-    if (err.message && err.message.includes("analyzed")) {
-      const { analyzed: _analyzed, ...fieldsWithoutAnalyzed } = fields;
-      await base(AIRTABLE_TABLE_ID).update([{ id: recordId, fields: fieldsWithoutAnalyzed }]);
-    } else {
-      throw err;
-    }
-  }
+  await base(AIRTABLE_TABLE_ID).update([{ id: recordId, fields }]);
+  console.log(`[analyzer]   💾  Airtable updated OK (${recordId})`);
 }
 
 // ── Main session runner ───────────────────────────────────────────────────────
@@ -320,7 +321,6 @@ async function runAnalysis(contacts, job) {
 
   const page = await context.newPage();
 
-  // Mask all automation signals
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
@@ -328,21 +328,31 @@ async function runAnalysis(contacts, job) {
     window.chrome = { runtime: {} };
   });
 
+  // Warm up: visit homepage first, then pause before first profile
+  console.log(`[analyzer] Warming up — visiting Instagram homepage...`);
+  await visitHomepage(page);
+  console.log(`[analyzer] Waiting ${INITIAL_WARMUP_MS / 1000}s before first profile...`);
+  await sleep(INITIAL_WARMUP_MS);
+
   job.status = "running";
   let consecutiveRateLimits = 0;
 
   for (let i = 0; i < contacts.length; i++) {
     const contact = contacts[i];
-    job.progress = i;
 
     // Long pause every PAUSE_EVERY profiles
     if (i > 0 && i % PAUSE_EVERY === 0) {
       console.log(`[analyzer] Pausing for ${PAUSE_MS / 60000}min after ${i} profiles...`);
       await sleep(PAUSE_MS);
+      // Re-warm homepage after long pause
+      await visitHomepage(page);
     }
 
     job.current = `@${contact.username}`;
     console.log(`[analyzer] [${i + 1}/${contacts.length}] @${contact.username}`);
+
+    // Visit homepage before each profile to mimic human navigation
+    await visitHomepage(page);
 
     try {
       const profileData = await scrapeProfile(page, contact.username);
@@ -369,18 +379,27 @@ async function runAnalysis(contacts, job) {
       console.log(`[analyzer]      Bio: ${(profileData.bio || "(none)").slice(0, 80)}`);
       console.log(`[analyzer]      Followers: ${profileData.followers || "?"}, Posts: ${profileData.posts || "?"}`);
 
+      // Claude analysis
+      console.log(`[analyzer]   🤖  Sending to Claude Haiku...`);
       const analysis = await analyzeWithClaude(anthropicClient, contact, profileData);
-      await updateAirtable(airtableBase, contact.record_id, analysis, profileData.bio);
+      console.log(`[analyzer]   🤖  Claude: ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
 
-      job.completed.push({
-        username: contact.username,
-        old_type: contact.current_type,
-        new_type: analysis.profile_type,
-        confidence: analysis.confidence,
-      });
+      // Airtable update
+      try {
+        await updateAirtable(airtableBase, contact.record_id, analysis, profileData.bio);
+        job.completed.push({
+          username: contact.username,
+          old_type: contact.current_type,
+          new_type: analysis.profile_type,
+          confidence: analysis.confidence,
+        });
+        console.log(`[analyzer]   ✓  Done. completed=${job.completed.length + 1}`);
+      } catch (airtableErr) {
+        console.error(`[analyzer]   ❌  Airtable update failed for @${contact.username}: ${airtableErr.message}`);
+        job.errors.push({ username: contact.username, error: `Airtable: ${airtableErr.message}` });
+      }
       job.progress = i + 1;
-
-      console.log(`[analyzer]   ✓  ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
+      console.log(`[analyzer]      progress=${job.progress}/${contacts.length}`);
 
     } catch (err) {
       if (err.message === "RATE_LIMIT") {
@@ -398,18 +417,23 @@ async function runAnalysis(contacts, job) {
           break;
         }
 
-        // Cool down then continue with next profile
-        console.log(`[analyzer]   ⏳  Cooling down ${RATE_LIMIT_COOLDOWN_MS / 1000}s before next profile...`);
+        // Cool down, then visit homepage before retrying
+        console.log(`[analyzer]   ⏳  Cooling down ${RATE_LIMIT_COOLDOWN_MS / 1000}s...`);
         await sleep(RATE_LIMIT_COOLDOWN_MS);
+        console.log(`[analyzer]   🏠  Visiting homepage before next profile...`);
+        await visitHomepage(page);
         continue;
       }
 
-      console.error(`[analyzer]   ✗  ${err.message}`);
+      console.error(`[analyzer]   ✗  Unhandled error: ${err.message}`);
       job.errors.push({ username: contact.username, error: err.message });
+      job.progress = i + 1;  // always advance progress, even on error
     }
 
     if (i < contacts.length - 1) {
-      await randomDelay();
+      const delayMs = Math.floor(Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS)) + MIN_DELAY_MS;
+      console.log(`[analyzer]   ⏳  Waiting ${(delayMs / 1000).toFixed(1)}s...`);
+      await sleep(delayMs);
     }
   }
 
@@ -422,7 +446,7 @@ async function runAnalysis(contacts, job) {
   job.current = null;
   job.finishedAt = new Date().toISOString();
   console.log(
-    `[analyzer] Session done — ${job.completed.length} processed, ${job.skipped.length} skipped, ${job.errors.length} errors`
+    `[analyzer] ════ Session done — completed=${job.completed.length} skipped=${job.skipped.length} errors=${job.errors.length} ════`
   );
 }
 
