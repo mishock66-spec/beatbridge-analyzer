@@ -8,9 +8,14 @@ const MIN_DELAY_MS = 3000;
 const MAX_DELAY_MS = 8000;
 const PAUSE_EVERY = 15;
 const PAUSE_MS = 5 * 60 * 1000;
+const RATE_LIMIT_COOLDOWN_MS = 30 * 1000; // wait 30s then continue
+const MAX_CONSECUTIVE_RATE_LIMITS = 3;    // stop session after 3 in a row
 
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || "appW42oNhB9Hl14bq";
 const AIRTABLE_TABLE_ID = process.env.AIRTABLE_TABLE_ID || "tbl0nVXbK5BQnU5FM";
+
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const SYSTEM_PROMPT = `You are analyzing Instagram profiles for BeatBridge, a hip-hop networking platform for beatmakers.
 
@@ -38,23 +43,47 @@ function randomDelay() {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── Scrape ────────────────────────────────────────────────────────────────────
+
 async function scrapeProfile(page, username) {
   const url = `https://www.instagram.com/${username}/`;
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(3000);
+
+    // Wait for network to settle — catches lazy-loaded content
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 15000 });
+    } catch {
+      // networkidle timeout is non-fatal — just proceed
+    }
 
     const current = page.url();
+
+    // Rate-limit / challenge signals
     if (
       current.includes("/accounts/login") ||
       current.includes("/challenge") ||
-      current.includes("/suspended")
+      current.includes("/suspended") ||
+      current.includes("/privacy/checks")
     ) {
       throw new Error("RATE_LIMIT");
     }
 
+    // Check body text for block indicators
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
+    if (
+      bodyText.includes("We restrict certain activity") ||
+      bodyText.includes("Let us know if you think") ||
+      bodyText.includes("suspicious activity")
+    ) {
+      throw new Error("RATE_LIMIT");
+    }
+
     if (
       bodyText.includes("Sorry, this page isn") ||
       bodyText.includes("This account is private")
@@ -65,15 +94,54 @@ async function scrapeProfile(page, username) {
       };
     }
 
-    const data = await page.evaluate(() => {
-      let bio = "";
-      const metaDesc =
-        document.querySelector('meta[name="description"]')?.content || "";
+    // ── Strategy 1: JSON-LD structured data ──────────────────────────────────
+    const jsonLdData = await page.evaluate(() => {
+      const scripts = [...document.querySelectorAll('script[type="application/ld+json"]')];
+      for (const s of scripts) {
+        try {
+          const d = JSON.parse(s.textContent || "");
+          if (d["@type"] === "ProfilePage" || d.mainEntity) return d;
+          if (Array.isArray(d)) {
+            const profile = d.find((e) => e["@type"] === "ProfilePage" || e.mainEntity);
+            if (profile) return profile;
+          }
+        } catch { /* skip malformed */ }
+      }
+      return null;
+    });
 
+    // ── Strategy 2: meta[name="description"] — usually has followers + bio ───
+    const metaDesc = await page.evaluate(
+      () => document.querySelector('meta[name="description"]')?.content || ""
+    );
+
+    // Parse bio from meta description
+    // Format: "X Followers, Y Following, Z Posts - See Instagram photos..."
+    // or:     "X Followers, Y Following, Z Posts - username: bio text here"
+    let bioFromMeta = "";
+    const metaBioMatch = metaDesc.match(/\d+[^\-]+-\s*[^:]+:\s*(.+)/);
+    if (metaBioMatch) bioFromMeta = metaBioMatch[1].trim();
+
+    // Parse follower counts from meta description
+    let followersFromMeta = "", followingFromMeta = "", postsFromMeta = "";
+    const fm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Follower/i);
+    const fgm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Following/i);
+    const pm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Post/i);
+    if (fm) followersFromMeta = fm[1];
+    if (fgm) followingFromMeta = fgm[1];
+    if (pm) postsFromMeta = pm[1];
+
+    // ── Strategy 3: DOM extraction ────────────────────────────────────────────
+    const domData = await page.evaluate(() => {
+      let bio = "";
       const bioSelectors = [
-        "header section > div > span",
+        // Modern Instagram bio span
+        "header section h1 ~ div span",
         "header section > div:last-child span",
+        "header section > div > span",
         "header section span[class]",
+        // Fallback: any non-stat span in header
+        "header span",
       ];
       for (const sel of bioSelectors) {
         for (const el of document.querySelectorAll(sel)) {
@@ -83,7 +151,9 @@ async function scrapeProfile(page, username) {
             !t.match(/^\d/) &&
             !t.includes(" followers") &&
             !t.includes(" following") &&
-            !t.includes(" posts")
+            !t.includes(" posts") &&
+            !t.includes("Edit profile") &&
+            !t.includes("Follow")
           ) {
             bio = t;
             break;
@@ -92,43 +162,33 @@ async function scrapeProfile(page, username) {
         if (bio) break;
       }
 
-      let followers = "",
-        following = "",
-        posts = "";
-      const statItems = [
-        ...document.querySelectorAll(
-          "header ul li, header section ul li, header section li"
-        ),
+      // Stats from <ul> in header
+      let followers = "", following = "", posts = "";
+      const liEls = [
+        ...document.querySelectorAll("header ul li, header section ul li, header section li"),
       ];
-      for (const li of statItems) {
+      for (const li of liEls) {
         const raw = li.innerText.replace(/\s+/g, " ").trim();
-        if (/follow/.test(raw) && !/ following/.test(raw)) {
+        if (/follower/i.test(raw) && !/following/i.test(raw)) {
           const m = raw.match(/([\d,. ]+[KkMm]?)\s*follower/i);
           if (m) followers = m[1].trim();
-        } else if (/following/.test(raw)) {
+        } else if (/following/i.test(raw)) {
           const m = raw.match(/([\d,. ]+[KkMm]?)\s*following/i);
           if (m) following = m[1].trim();
-        } else if (/post/.test(raw)) {
+        } else if (/post/i.test(raw)) {
           const m = raw.match(/([\d,. ]+[KkMm]?)\s*post/i);
           if (m) posts = m[1].trim();
         }
       }
 
-      if (!followers && metaDesc) {
-        const fm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Follower/i);
-        const fgm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Following/i);
-        const pm = metaDesc.match(/([\d,.]+[KkMm]?)\s*Post/i);
-        if (fm) followers = fm[1];
-        if (fgm) following = fgm[1];
-        if (pm) posts = pm[1];
-      }
-
+      // Full name from header
       const nameEl =
-        document.querySelector("header h1") ||
         document.querySelector("header h2") ||
+        document.querySelector("header h1") ||
         document.querySelector("header section > div:first-child span");
       const fullName = nameEl?.innerText?.trim() || "";
 
+      // Post captions from img alt attributes
       const postImgs = [
         ...document.querySelectorAll("article img[alt], main img[alt]"),
       ].slice(0, 12);
@@ -136,15 +196,34 @@ async function scrapeProfile(page, username) {
         .map((img) => img.alt?.trim())
         .filter((t) => t && t.length > 5);
 
-      return { bio, metaDesc, followers, following, posts, fullName, postCaptions };
+      return { bio, followers, following, posts, fullName, postCaptions };
     });
 
-    return data;
+    // Merge strategies: DOM > meta fallbacks
+    const bio = domData.bio || bioFromMeta;
+    const followers = domData.followers || followersFromMeta;
+    const following = domData.following || followingFromMeta;
+    const posts = domData.posts || postsFromMeta;
+    const fullName = domData.fullName ||
+      (jsonLdData?.mainEntity?.name) || "";
+
+    return {
+      bio,
+      metaDesc,
+      followers,
+      following,
+      posts,
+      fullName,
+      postCaptions: domData.postCaptions,
+    };
+
   } catch (err) {
     if (err.message === "RATE_LIMIT") throw err;
     return { error: err.message };
   }
 }
+
+// ── Claude analysis ───────────────────────────────────────────────────────────
 
 async function analyzeWithClaude(client, contact, profileData) {
   const profileCtx = [
@@ -177,6 +256,8 @@ async function analyzeWithClaude(client, contact, profileData) {
   return JSON.parse(jsonMatch[0]);
 }
 
+// ── Airtable update ───────────────────────────────────────────────────────────
+
 async function updateAirtable(base, recordId, analysis, existingBio) {
   const newBio = existingBio
     ? `${existingBio}\n— Analysis: ${analysis.analysis_note}`
@@ -192,41 +273,33 @@ async function updateAirtable(base, recordId, analysis, existingBio) {
   try {
     await base(AIRTABLE_TABLE_ID).update([{ id: recordId, fields }]);
   } catch (err) {
-    // Retry without "analyzed" if the field doesn't exist yet
     if (err.message && err.message.includes("analyzed")) {
       const { analyzed: _analyzed, ...fieldsWithoutAnalyzed } = fields;
-      await base(AIRTABLE_TABLE_ID).update([
-        { id: recordId, fields: fieldsWithoutAnalyzed },
-      ]);
+      await base(AIRTABLE_TABLE_ID).update([{ id: recordId, fields: fieldsWithoutAnalyzed }]);
     } else {
       throw err;
     }
   }
 }
 
-/**
- * Run a full analysis session.
- * @param {object[]} contacts  — array from the queue
- * @param {object}   job       — shared job state object (mutated in place)
- */
-async function runAnalysis(contacts, job) {
-  const anthropicClient = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY,
-  });
+// ── Main session runner ───────────────────────────────────────────────────────
 
-  const airtableBase = new Airtable({
-    apiKey: process.env.AIRTABLE_API_KEY,
-  }).base(AIRTABLE_BASE_ID);
+async function runAnalysis(contacts, job) {
+  const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const airtableBase = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 
   let browser;
   try {
     browser = await chromium.launch({
       headless: true,
       args: [
-        "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
+        "--disable-web-security",
+        "--lang=en-US,en",
+        `--user-agent=${USER_AGENT}`,
       ],
     });
   } catch (err) {
@@ -236,18 +309,27 @@ async function runAnalysis(contacts, job) {
   }
 
   const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 900 },
+    userAgent: USER_AGENT,
+    locale: "en-US",
+    timezoneId: "America/New_York",
+    viewport: { width: 1280, height: 800 },
+    extraHTTPHeaders: {
+      "Accept-Language": "en-US,en;q=0.9",
+    },
   });
 
   const page = await context.newPage();
+
+  // Mask all automation signals
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
     window.chrome = { runtime: {} };
   });
 
   job.status = "running";
+  let consecutiveRateLimits = 0;
 
   for (let i = 0; i < contacts.length; i++) {
     const contact = contacts[i];
@@ -256,7 +338,7 @@ async function runAnalysis(contacts, job) {
     // Long pause every PAUSE_EVERY profiles
     if (i > 0 && i % PAUSE_EVERY === 0) {
       console.log(`[analyzer] Pausing for ${PAUSE_MS / 60000}min after ${i} profiles...`);
-      await new Promise((r) => setTimeout(r, PAUSE_MS));
+      await sleep(PAUSE_MS);
     }
 
     console.log(`[analyzer] [${i + 1}/${contacts.length}] @${contact.username}`);
@@ -264,17 +346,25 @@ async function runAnalysis(contacts, job) {
     try {
       const profileData = await scrapeProfile(page, contact.username);
 
+      // Reset rate-limit streak on a successful page load
+      consecutiveRateLimits = 0;
+
       if (profileData.skipped) {
+        console.log(`[analyzer]   ⏭  Skipped: ${profileData.reason}`);
         job.skipped.push({ username: contact.username, reason: profileData.reason });
         await randomDelay();
         continue;
       }
 
       if (profileData.error) {
+        console.log(`[analyzer]   ✗  Scrape error: ${profileData.error}`);
         job.errors.push({ username: contact.username, error: profileData.error });
         await randomDelay();
         continue;
       }
+
+      console.log(`[analyzer]      Bio: ${(profileData.bio || "(none)").slice(0, 80)}`);
+      console.log(`[analyzer]      Followers: ${profileData.followers || "?"}, Posts: ${profileData.posts || "?"}`);
 
       const analysis = await analyzeWithClaude(anthropicClient, contact, profileData);
       await updateAirtable(airtableBase, contact.record_id, analysis, profileData.bio);
@@ -286,15 +376,29 @@ async function runAnalysis(contacts, job) {
         confidence: analysis.confidence,
       });
 
-      console.log(
-        `[analyzer]   ✓  ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`
-      );
+      console.log(`[analyzer]   ✓  ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
+
     } catch (err) {
       if (err.message === "RATE_LIMIT") {
-        console.log("[analyzer] Rate limit detected — stopping session.");
-        job.status = "rate_limited";
-        break;
+        consecutiveRateLimits++;
+        console.log(
+          `[analyzer]   ⚠️  Rate limit on @${contact.username} (${consecutiveRateLimits}/${MAX_CONSECUTIVE_RATE_LIMITS} consecutive)`
+        );
+
+        job.skipped.push({ username: contact.username, reason: "Rate limited" });
+
+        if (consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
+          console.log("[analyzer] Too many consecutive rate limits — stopping session.");
+          job.status = "rate_limited";
+          break;
+        }
+
+        // Cool down then continue with next profile
+        console.log(`[analyzer]   ⏳  Cooling down ${RATE_LIMIT_COOLDOWN_MS / 1000}s before next profile...`);
+        await sleep(RATE_LIMIT_COOLDOWN_MS);
+        continue;
       }
+
       console.error(`[analyzer]   ✗  ${err.message}`);
       job.errors.push({ username: contact.username, error: err.message });
     }
@@ -312,7 +416,7 @@ async function runAnalysis(contacts, job) {
   job.progress = contacts.length;
   job.finishedAt = new Date().toISOString();
   console.log(
-    `[analyzer] Session done — ${job.completed.length} processed, ${job.errors.length} errors`
+    `[analyzer] Session done — ${job.completed.length} processed, ${job.skipped.length} skipped, ${job.errors.length} errors`
   );
 }
 
