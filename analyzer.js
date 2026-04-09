@@ -275,9 +275,10 @@ async function updateAirtable(base, recordId, analysis, existingBio) {
     : `— Analysis: ${analysis.analysis_note}`;
 
   const fields = {};
-  if (analysis.template)    fields["fldy8ho1lxBh8iB3n"] = analysis.template;
-  if (analysis.profile_type) fields["fld8dCqjrnqCsRSog"] = analysis.profile_type;
+  if (analysis.template)     fields["fldy8ho1lxBh8iB3n"] = analysis.template;
+  if (analysis.profile_type) fields["fld8dCqjrnqCsRSog"]  = analysis.profile_type;
   fields["fldpLozVCrvYj62i0"] = newBio;
+  fields["fldLRttkukXJiVs0u"] = true; // analyzed checkbox
 
   await base(AIRTABLE_TABLE_ID).update([{ id: recordId, fields }]);
   console.log(`[analyzer]   💾  Airtable updated OK (${recordId})`);
