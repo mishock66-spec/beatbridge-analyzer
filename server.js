@@ -5,6 +5,16 @@ const crypto = require("crypto");
 const { runAnalysis } = require("./analyzer");
 
 const app = express();
+
+// CORS — allow requests from any origin (status polling from beatbridge.live)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
@@ -66,6 +76,7 @@ app.post("/analyze", (req, res) => {
     status: "queued",
     total: contacts.length,
     progress: 0,
+    current: null,   // username currently being analyzed
     completed: [],
     skipped: [],
     errors: [],
@@ -104,6 +115,7 @@ app.get("/status/:jobId", (req, res) => {
     status: job.status,
     progress: job.progress,
     total: job.total,
+    current: job.current,
     completed: job.completed.length,
     skipped: job.skipped.length,
     errors: job.errors.length,

@@ -341,6 +341,7 @@ async function runAnalysis(contacts, job) {
       await sleep(PAUSE_MS);
     }
 
+    job.current = `@${contact.username}`;
     console.log(`[analyzer] [${i + 1}/${contacts.length}] @${contact.username}`);
 
     try {
@@ -352,6 +353,7 @@ async function runAnalysis(contacts, job) {
       if (profileData.skipped) {
         console.log(`[analyzer]   ⏭  Skipped: ${profileData.reason}`);
         job.skipped.push({ username: contact.username, reason: profileData.reason });
+        job.progress = i + 1;
         await randomDelay();
         continue;
       }
@@ -359,6 +361,7 @@ async function runAnalysis(contacts, job) {
       if (profileData.error) {
         console.log(`[analyzer]   ✗  Scrape error: ${profileData.error}`);
         job.errors.push({ username: contact.username, error: profileData.error });
+        job.progress = i + 1;
         await randomDelay();
         continue;
       }
@@ -375,6 +378,7 @@ async function runAnalysis(contacts, job) {
         new_type: analysis.profile_type,
         confidence: analysis.confidence,
       });
+      job.progress = i + 1;
 
       console.log(`[analyzer]   ✓  ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
 
@@ -386,6 +390,7 @@ async function runAnalysis(contacts, job) {
         );
 
         job.skipped.push({ username: contact.username, reason: "Rate limited" });
+        job.progress = i + 1;
 
         if (consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
           console.log("[analyzer] Too many consecutive rate limits — stopping session.");
@@ -414,6 +419,7 @@ async function runAnalysis(contacts, job) {
     job.status = "completed";
   }
   job.progress = contacts.length;
+  job.current = null;
   job.finishedAt = new Date().toISOString();
   console.log(
     `[analyzer] Session done — ${job.completed.length} processed, ${job.skipped.length} skipped, ${job.errors.length} errors`
