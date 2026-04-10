@@ -231,8 +231,35 @@ async function scrapeProfile(page, username) {
 
 // ── Claude analysis ───────────────────────────────────────────────────────────
 
-async function analyzeWithClaude(client, contact, profileData) {
-  const profileCtx = [
+const VISION_PROMPT = `You are analyzing an Instagram profile for BeatBridge, a hip-hop networking platform for beatmakers.
+
+Look at the screenshot carefully:
+- Profile photo: what does it show?
+- Post grid: what kind of content? (studio, beats, lifestyle, sports, food, concerts, etc.)
+- Any visible text in images?
+- Overall vibe: music production? rap/artist? unrelated?
+
+Profile type options (choose ONE):
+Beatmaker/Producteur, Artiste/Rappeur, Manager, Ingé son, Label, DJ, Photographe/Vidéaste, Autre
+
+DM template rules:
+- 1–2 sentences maximum
+- Opens with: "Hey [name],"
+- References something SPECIFIC and VISUAL from their profile
+- Ends with exactly one of: "think we could build something?", "would love to connect.", or "open to hear your thoughts."
+- NEVER includes a link or URL
+- Use the literal placeholder: [BEATMAKER_NAME]
+
+Return ONLY valid JSON, nothing else:
+{
+  "profile_type": "...",
+  "template": "Hey [name], I'm [BEATMAKER_NAME]...",
+  "analysis_note": "One-line reason for the classification",
+  "confidence": "high|medium|low"
+}`;
+
+function buildTextContext(contact, profileData) {
+  return [
     `Username: @${contact.username}`,
     `Current type in database: ${contact.current_type}`,
     `Artist network: ${contact.artist}`,
@@ -245,15 +272,46 @@ async function analyzeWithClaude(client, contact, profileData) {
     ...(profileData.postCaptions
       ?.slice(0, 6)
       .map((c, i) => `  ${i + 1}. ${c.slice(0, 120)}`) || ["  (none visible)"]),
-    `---`,
-    `Current DM template: ${contact.current_template || "(none)"}`,
   ].join("\n");
+}
+
+// Vision analysis using claude-sonnet-4-20250514 with screenshot
+async function analyzeWithVision(client, contact, profileData, screenshotBase64) {
+  const textCtx = buildTextContext(contact, profileData);
+
+  const message = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 500,
+    messages: [{
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/jpeg", data: screenshotBase64 },
+        },
+        {
+          type: "text",
+          text: `${VISION_PROMPT}\n\nProfile context:\n${textCtx}`,
+        },
+      ],
+    }],
+  });
+
+  const text = message.content?.[0]?.text || "";
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error(`No JSON in vision response: ${text.slice(0, 200)}`);
+  return JSON.parse(jsonMatch[0]);
+}
+
+// Text-only fallback using Claude Haiku (no screenshot)
+async function analyzeWithText(client, contact, profileData) {
+  const textCtx = buildTextContext(contact, profileData);
 
   const message = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 512,
     system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: profileCtx }],
+    messages: [{ role: "user", content: textCtx }],
   });
 
   const text = message.content?.[0]?.text || "";
@@ -386,10 +444,28 @@ async function runAnalysis(contacts, job) {
       console.log(`[analyzer]      Bio: ${(profileData.bio || "(none)").slice(0, 80)}`);
       console.log(`[analyzer]      Followers: ${profileData.followers || "?"}, Posts: ${profileData.posts || "?"}`);
 
-      // Claude analysis
-      console.log(`[analyzer]   🤖  Sending to Claude Haiku...`);
-      const analysis = await analyzeWithClaude(anthropicClient, contact, profileData);
-      console.log(`[analyzer]   🤖  Claude: ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
+      // Screenshot for vision analysis
+      let screenshotBase64 = null;
+      try {
+        const buf = await page.screenshot({ fullPage: false, type: "jpeg", quality: 80 });
+        screenshotBase64 = buf.toString("base64");
+        console.log(`[analyzer]   📸  Screenshot captured (${Math.round(buf.length / 1024)}KB)`);
+      } catch (ssErr) {
+        console.log(`[analyzer]   📸  Screenshot failed: ${ssErr.message} — falling back to text`);
+      }
+
+      // Claude analysis — vision if screenshot available, text fallback otherwise
+      let analysis;
+      if (screenshotBase64) {
+        console.log(`[analyzer]   👁  Sending to Claude Sonnet (vision)...`);
+        analysis = await analyzeWithVision(anthropicClient, contact, profileData, screenshotBase64);
+        console.log(`[analyzer]   👁  Vision: ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
+        console.log(`[analyzer]      Note: ${analysis.analysis_note}`);
+      } else {
+        console.log(`[analyzer]   🤖  Sending to Claude Haiku (text only)...`);
+        analysis = await analyzeWithText(anthropicClient, contact, profileData);
+        console.log(`[analyzer]   🤖  Text: ${contact.current_type} → ${analysis.profile_type} [${analysis.confidence}]`);
+      }
 
       // Airtable update
       try {
