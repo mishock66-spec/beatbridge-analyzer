@@ -4,12 +4,12 @@ const { chromium } = require("playwright");
 const Anthropic = require("@anthropic-ai/sdk");
 const Airtable = require("airtable");
 
-const MIN_DELAY_MS = 8000;   // increased from 3s
-const MAX_DELAY_MS = 15000;  // increased from 8s
+const MIN_DELAY_MS = 15000;  // 15s minimum between profiles
+const MAX_DELAY_MS = 25000;  // 25s maximum between profiles
 const PAUSE_EVERY = 15;
 const PAUSE_MS = 5 * 60 * 1000;
-const RATE_LIMIT_COOLDOWN_MS = 30 * 1000;
-const MAX_CONSECUTIVE_RATE_LIMITS = 3;
+const RATE_LIMIT_COOLDOWN_MS = 60 * 1000; // 60s cooldown after rate limit
+const MAX_CONSECUTIVE_RATE_LIMITS = 2;    // stop after 2 in a row
 const INITIAL_WARMUP_MS = 5000; // wait before first profile
 
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || "appW42oNhB9Hl14bq";
@@ -329,11 +329,17 @@ async function runAnalysis(contacts, job) {
     window.chrome = { runtime: {} };
   });
 
-  // Warm up: visit homepage first, then pause before first profile
-  console.log(`[analyzer] Warming up — visiting Instagram homepage...`);
-  await visitHomepage(page);
-  console.log(`[analyzer] Waiting ${INITIAL_WARMUP_MS / 1000}s before first profile...`);
-  await sleep(INITIAL_WARMUP_MS);
+  // Warm up: visit homepage with networkidle to fully load before starting
+  console.log(`[analyzer] Warming up — visiting Instagram homepage (networkidle)...`);
+  try {
+    await page.goto("https://www.instagram.com/", { waitUntil: "networkidle", timeout: 30000 });
+    await humanMouseMove(page);
+  } catch {
+    // non-fatal
+  }
+  const warmupMs = 3000 + Math.random() * 2000;
+  console.log(`[analyzer] Waiting ${(warmupMs / 1000).toFixed(1)}s before first profile...`);
+  await sleep(warmupMs);
 
   job.status = "running";
   let consecutiveRateLimits = 0;
