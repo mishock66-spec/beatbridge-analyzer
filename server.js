@@ -3,6 +3,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { runAnalysis } = require("./analyzer");
+const { runClassifyAndGenerate, runGenerateTemplates } = require("./classifier");
 
 const app = express();
 
@@ -130,6 +131,72 @@ app.get("/status/:jobId", (req, res) => {
         }
       : {}),
   });
+});
+
+// ── POST /classify-and-generate ──────────────────────────────────────────────
+// Fetches contacts where Type de profil = "Autre" for the given artist,
+// runs Claude Haiku to classify + generate DM template, updates Airtable.
+
+app.post("/classify-and-generate", async (req, res) => {
+  if (!validateSecret(req, res)) return;
+
+  const { artist, batchSize } = req.body;
+  if (!artist || typeof artist !== "string") {
+    return res.status(400).json({ error: "artist is required" });
+  }
+
+  const size = Number(batchSize) || 50;
+  if (size < 1 || size > 200) {
+    return res.status(400).json({ error: "batchSize must be between 1 and 200" });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured on server" });
+  }
+  if (!process.env.AIRTABLE_API_KEY) {
+    return res.status(500).json({ error: "AIRTABLE_API_KEY not configured on server" });
+  }
+
+  try {
+    const result = await runClassifyAndGenerate(artist, size);
+    res.json(result);
+  } catch (err) {
+    console.error("[classify-and-generate] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /generate-templates ──────────────────────────────────────────────────
+// Fetches contacts that have a profile type but no/bad template,
+// runs Claude Haiku to generate DM template, updates Airtable.
+
+app.post("/generate-templates", async (req, res) => {
+  if (!validateSecret(req, res)) return;
+
+  const { artist, batchSize } = req.body;
+  if (!artist || typeof artist !== "string") {
+    return res.status(400).json({ error: "artist is required" });
+  }
+
+  const size = Number(batchSize) || 50;
+  if (size < 1 || size > 200) {
+    return res.status(400).json({ error: "batchSize must be between 1 and 200" });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured on server" });
+  }
+  if (!process.env.AIRTABLE_API_KEY) {
+    return res.status(500).json({ error: "AIRTABLE_API_KEY not configured on server" });
+  }
+
+  try {
+    const result = await runGenerateTemplates(artist, size);
+    res.json(result);
+  } catch (err) {
+    console.error("[generate-templates] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── 404 fallback ──────────────────────────────────────────────────────────────
