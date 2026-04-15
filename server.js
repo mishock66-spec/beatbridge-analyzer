@@ -140,7 +140,7 @@ app.get("/status/:jobId", (req, res) => {
 app.post("/classify-and-generate", async (req, res) => {
   if (!validateSecret(req, res)) return;
 
-  const { artist, batchSize } = req.body;
+  const { artist, batchSize, forceAll } = req.body;
   if (!artist || typeof artist !== "string") {
     return res.status(400).json({ error: "artist is required" });
   }
@@ -158,7 +158,7 @@ app.post("/classify-and-generate", async (req, res) => {
   }
 
   try {
-    const result = await runClassifyAndGenerate(artist, size);
+    const result = await runClassifyAndGenerate(artist, size, forceAll === true);
     res.json(result);
   } catch (err) {
     console.error("[classify-and-generate] Error:", err.message);

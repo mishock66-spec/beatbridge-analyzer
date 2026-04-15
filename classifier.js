@@ -114,14 +114,16 @@ async function updateRecord(base, recordId, profileType, template) {
 
 // ── Main: classify unclassified contacts ──────────────────────────────────────
 
-async function runClassifyAndGenerate(artist, batchSize) {
+async function runClassifyAndGenerate(artist, batchSize, forceAll = false) {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
   const jobId = crypto.randomBytes(8).toString("hex");
 
-  console.log(`[classifier] classify-and-generate — artist=${artist} batchSize=${batchSize} jobId=${jobId}`);
+  console.log(`[classifier] classify-and-generate — artist=${artist} batchSize=${batchSize} forceAll=${forceAll} jobId=${jobId}`);
 
-  const filter = `AND({Suivi par} = "${artist}", {Type de profil} = "Autre")`;
+  const filter = forceAll
+    ? `{Suivi par} = "${artist}"`
+    : `AND({Suivi par} = "${artist}", {Type de profil} = "Autre")`;
   const allRecords = await fetchRecords(base, filter, []);
   const records = allRecords.slice(0, batchSize);
 
