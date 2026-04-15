@@ -218,4 +218,12 @@ app.listen(PORT, () => {
   if (!process.env.AIRTABLE_API_KEY) {
     console.warn("⚠️  AIRTABLE_API_KEY is not set");
   }
+
+  // Start Bull queue worker if Redis is configured
+  if (process.env.REDIS_URL) {
+    require("./worker");
+    console.log("✅ Bull queue worker started");
+  } else {
+    console.warn("⚠️  REDIS_URL not set — Bull queue worker disabled");
+  }
 });
