@@ -147,8 +147,8 @@ app.post("/classify-and-generate", (req, res) => {
   }
 
   const size = Number(batchSize) || 50;
-  if (size < 1 || size > 200) {
-    return res.status(400).json({ error: "batchSize must be between 1 and 200" });
+  if (size < 1) {
+    return res.status(400).json({ error: "batchSize must be at least 1 (use 9999 for Process All)" });
   }
 
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -200,8 +200,8 @@ app.post("/generate-templates", (req, res) => {
   }
 
   const size = Number(batchSize) || 50;
-  if (size < 1 || size > 200) {
-    return res.status(400).json({ error: "batchSize must be between 1 and 200" });
+  if (size < 1) {
+    return res.status(400).json({ error: "batchSize must be at least 1 (use 9999 for Process All)" });
   }
 
   if (!process.env.ANTHROPIC_API_KEY) {
