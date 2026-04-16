@@ -134,10 +134,11 @@ app.get("/status/:jobId", (req, res) => {
 });
 
 // ── POST /classify-and-generate ──────────────────────────────────────────────
-// Fetches contacts where Type de profil = "Autre" for the given artist,
-// runs Claude Haiku to classify + generate DM template, updates Airtable.
+// Starts a background job: fetches contacts where Type de profil = "Autre"
+// (or all if forceAll), classifies + generates DM templates, updates Airtable.
+// Returns { jobId, status: "started", total } immediately — poll /status/:jobId.
 
-app.post("/classify-and-generate", async (req, res) => {
+app.post("/classify-and-generate", (req, res) => {
   if (!validateSecret(req, res)) return;
 
   const { artist, batchSize, forceAll } = req.body;
@@ -157,20 +158,40 @@ app.post("/classify-and-generate", async (req, res) => {
     return res.status(500).json({ error: "AIRTABLE_API_KEY not configured on server" });
   }
 
-  try {
-    const result = await runClassifyAndGenerate(artist, size, forceAll === true);
-    res.json(result);
-  } catch (err) {
-    console.error("[classify-and-generate] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
+  const jobId = generateJobId();
+  const job = {
+    jobId,
+    status: "queued",
+    total: 0,
+    progress: 0,
+    current: null,
+    completed: [],
+    skipped: [],
+    errors: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+  };
+
+  jobs.set(jobId, job);
+
+  setImmediate(() => {
+    runClassifyAndGenerate(artist, size, forceAll === true, job).catch((err) => {
+      job.status = "failed";
+      job.error = err.message;
+      job.finishedAt = new Date().toISOString();
+      console.error("[classify-and-generate] Unhandled error:", err);
+    });
+  });
+
+  res.json({ jobId, status: "started", total: 0 });
 });
 
 // ── POST /generate-templates ──────────────────────────────────────────────────
-// Fetches contacts that have a profile type but no/bad template,
-// runs Claude Haiku to generate DM template, updates Airtable.
+// Starts a background job: fetches contacts that have a profile type but no/bad
+// template, generates DM templates, updates Airtable.
+// Returns { jobId, status: "started", total } immediately — poll /status/:jobId.
 
-app.post("/generate-templates", async (req, res) => {
+app.post("/generate-templates", (req, res) => {
   if (!validateSecret(req, res)) return;
 
   const { artist, batchSize } = req.body;
@@ -190,13 +211,32 @@ app.post("/generate-templates", async (req, res) => {
     return res.status(500).json({ error: "AIRTABLE_API_KEY not configured on server" });
   }
 
-  try {
-    const result = await runGenerateTemplates(artist, size);
-    res.json(result);
-  } catch (err) {
-    console.error("[generate-templates] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
+  const jobId = generateJobId();
+  const job = {
+    jobId,
+    status: "queued",
+    total: 0,
+    progress: 0,
+    current: null,
+    completed: [],
+    skipped: [],
+    errors: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+  };
+
+  jobs.set(jobId, job);
+
+  setImmediate(() => {
+    runGenerateTemplates(artist, size, job).catch((err) => {
+      job.status = "failed";
+      job.error = err.message;
+      job.finishedAt = new Date().toISOString();
+      console.error("[generate-templates] Unhandled error:", err);
+    });
+  });
+
+  res.json({ jobId, status: "started", total: 0 });
 });
 
 // ── 404 fallback ──────────────────────────────────────────────────────────────

@@ -1,6 +1,5 @@
 "use strict";
 
-const crypto = require("crypto");
 const Anthropic = require("@anthropic-ai/sdk");
 const Airtable = require("airtable");
 
@@ -114,12 +113,11 @@ async function updateRecord(base, recordId, profileType, template) {
 
 // ── Main: classify unclassified contacts ──────────────────────────────────────
 
-async function runClassifyAndGenerate(artist, batchSize, forceAll = false) {
+async function runClassifyAndGenerate(artist, batchSize, forceAll = false, job = null) {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
-  const jobId = crypto.randomBytes(8).toString("hex");
 
-  console.log(`[classifier] classify-and-generate — artist=${artist} batchSize=${batchSize} forceAll=${forceAll} jobId=${jobId}`);
+  console.log(`[classifier] classify-and-generate — artist=${artist} batchSize=${batchSize} forceAll=${forceAll}`);
 
   const filter = forceAll
     ? `{Suivi par} = "${artist}"`
@@ -127,7 +125,13 @@ async function runClassifyAndGenerate(artist, batchSize, forceAll = false) {
   const allRecords = await fetchRecords(base, filter, []);
   const records = allRecords.slice(0, batchSize);
 
-  console.log(`[classifier] fetched ${records.length} unclassified records (${allRecords.length} total matching)`);
+  console.log(`[classifier] fetched ${records.length} records (${allRecords.length} total matching)`);
+
+  // Update job with real total now that we know it
+  if (job) {
+    job.total = records.length;
+    job.status = "running";
+  }
 
   let processed = 0;
   const errors = [];
@@ -136,6 +140,8 @@ async function runClassifyAndGenerate(artist, batchSize, forceAll = false) {
     const username = record.fields["Pseudo Instagram"] || record.id;
     const notes    = record.fields["Notes"] || "";
 
+    if (job) job.current = `@${username}`;
+
     try {
       const result = await classifyContact(client, username, notes, artist);
       const profileType = result.profile_type || "Autre";
@@ -143,19 +149,29 @@ async function runClassifyAndGenerate(artist, batchSize, forceAll = false) {
 
       await updateRecord(base, record.id, profileType, template);
       processed++;
+      if (job) {
+        job.progress++;
+        job.completed.push({ username, profileType });
+      }
       console.log(`[classifier] ✓ @${username} → ${profileType}`);
     } catch (err) {
       console.error(`[classifier] ✗ @${username}: ${err.message}`);
       errors.push({ username, error: err.message });
+      if (job) job.errors.push({ username, error: err.message });
     }
 
     // Brief pause between Claude calls
     await new Promise((r) => setTimeout(r, 300));
   }
 
+  if (job) {
+    job.status = "completed";
+    job.current = null;
+    job.finishedAt = new Date().toISOString();
+  }
+
   const remaining = Math.max(0, allRecords.length - batchSize);
   return {
-    jobId,
     processed,
     total: records.length,
     remaining,
@@ -166,12 +182,11 @@ async function runClassifyAndGenerate(artist, batchSize, forceAll = false) {
 
 // ── Main: generate templates for already-classified contacts ──────────────────
 
-async function runGenerateTemplates(artist, batchSize) {
+async function runGenerateTemplates(artist, batchSize, job = null) {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
-  const jobId = crypto.randomBytes(8).toString("hex");
 
-  console.log(`[classifier] generate-templates — artist=${artist} batchSize=${batchSize} jobId=${jobId}`);
+  console.log(`[classifier] generate-templates — artist=${artist} batchSize=${batchSize}`);
 
   // Fetch contacts that have a profile type set (not "Autre", not empty)
   const filter = `AND({Suivi par} = "${artist}", {Type de profil} != "Autre", {Type de profil} != "")`;
@@ -187,6 +202,12 @@ async function runGenerateTemplates(artist, batchSize) {
 
   console.log(`[classifier] ${toProcess.length} records need template (${allRecords.length} total typed)`);
 
+  // Update job with real total
+  if (job) {
+    job.total = toProcess.length;
+    job.status = "running";
+  }
+
   let processed = 0;
   const errors = [];
 
@@ -195,6 +216,8 @@ async function runGenerateTemplates(artist, batchSize) {
     const notes       = record.fields["Notes"] || "";
     const profileType = record.fields["Type de profil"] || "Autre";
 
+    if (job) job.current = `@${username}`;
+
     try {
       // Get bioRef via Haiku (no reclassification — keep existing type)
       const result  = await classifyContact(client, username, notes, artist);
@@ -202,13 +225,24 @@ async function runGenerateTemplates(artist, batchSize) {
 
       await updateRecord(base, record.id, profileType, template);
       processed++;
+      if (job) {
+        job.progress++;
+        job.completed.push({ username, profileType });
+      }
       console.log(`[classifier] ✓ @${username} (${profileType}) → template generated`);
     } catch (err) {
       console.error(`[classifier] ✗ @${username}: ${err.message}`);
       errors.push({ username, error: err.message });
+      if (job) job.errors.push({ username, error: err.message });
     }
 
     await new Promise((r) => setTimeout(r, 300));
+  }
+
+  if (job) {
+    job.status = "completed";
+    job.current = null;
+    job.finishedAt = new Date().toISOString();
   }
 
   const remaining = Math.max(0, allRecords.filter((r) => {
@@ -217,7 +251,6 @@ async function runGenerateTemplates(artist, batchSize) {
   }).length - batchSize);
 
   return {
-    jobId,
     processed,
     total: toProcess.length,
     remaining: Math.max(0, remaining),
