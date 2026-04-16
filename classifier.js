@@ -184,6 +184,15 @@ async function processBatchLoop({ records, batchFn, buildUpdate, job, label }) {
           job.completed.push(
             ...updates.map((u) => ({ username: u._username, profileType: u.profileType }))
           );
+          // Store change history
+          for (const u of updates) {
+            job.changes.push({
+              username: u._username,
+              oldType:  u._oldType,
+              newType:  u.profileType,
+              template: u.template,
+            });
+          }
         }
         console.log(`[classifier] ✓ ${label} batch ${batchNum}: ${updates.length} done`);
       }
@@ -255,6 +264,7 @@ async function runClassifyAndGenerate(artist, batchSize, forceAll = false, job =
       profileType: r.profile_type || "Autre",
       template:    r.template || "",
       _username:   c.username,
+      _oldType:    c.profileType,
     }),
     job,
     label: "classify",
@@ -318,6 +328,7 @@ async function runGenerateTemplates(artist, batchSize, job = null) {
       profileType: c.profileType,       // keep existing type
       template:    r.template || "",
       _username:   c.username,
+      _oldType:    c.profileType,       // same — type unchanged
     }),
     job,
     label: "templates",

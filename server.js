@@ -128,6 +128,7 @@ app.get("/status/:jobId", (req, res) => {
           results: job.completed,
           errorDetails: job.errors,
           skippedDetails: job.skipped,
+          changes: job.changes,
         }
       : {}),
   });
@@ -168,6 +169,7 @@ app.post("/classify-and-generate", (req, res) => {
     completed: [],
     skipped: [],
     errors: [],
+    changes: [],
     startedAt: new Date().toISOString(),
     finishedAt: null,
   };
@@ -221,6 +223,7 @@ app.post("/generate-templates", (req, res) => {
     completed: [],
     skipped: [],
     errors: [],
+    changes: [],
     startedAt: new Date().toISOString(),
     finishedAt: null,
   };
