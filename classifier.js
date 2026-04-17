@@ -36,7 +36,7 @@ function fetchRecords(base, filterFormula, extraFields) {
   });
 }
 
-// Update up to 10 records in a single Airtable call
+// Update up to 10 records in a single Airtable call (classify + template + follow_up)
 async function updateRecordsBatch(base, updates) {
   await base(AIRTABLE_TABLE_ID).update(
     updates.map((u) => ({
@@ -45,6 +45,19 @@ async function updateRecordsBatch(base, updates) {
         [FIELD_PROFILE_TYPE]: u.profileType,
         [FIELD_TEMPLATE]:     u.template,
         [FIELD_FOLLOW_UP]:    FOLLOW_UP_TEXT,
+      },
+    }))
+  );
+}
+
+// Template-only update — does NOT touch the profile type field (avoids select-value errors)
+async function updateTemplatesOnlyBatch(base, updates) {
+  await base(AIRTABLE_TABLE_ID).update(
+    updates.map((u) => ({
+      id: u.id,
+      fields: {
+        [FIELD_TEMPLATE]:  u.template,
+        [FIELD_FOLLOW_UP]: FOLLOW_UP_TEXT,
       },
     }))
   );
@@ -157,7 +170,8 @@ async function generateTemplatesBatch(client, contacts, artist) {
 
 // ── Shared: run a batch loop over records ─────────────────────────────────────
 
-async function processBatchLoop({ records, batchFn, buildUpdate, job, label }) {
+async function processBatchLoop({ records, batchFn, buildUpdate, updateFn, job, label }) {
+  const doUpdate = updateFn || updateRecordsBatch;
   let processed = 0;
   const errors = [];
 
@@ -169,22 +183,38 @@ async function processBatchLoop({ records, batchFn, buildUpdate, job, label }) {
       job.current = `@${batch[0].username}${batch.length > 1 ? ` +${batch.length - 1}` : ""}`;
     }
 
+    let results;
+    // ── Step 1: Claude API call ───────────────────────────────────────────────
     try {
-      const results = await batchFn(batch);
+      results = await batchFn(batch);
+    } catch (claudeErr) {
+      console.error(`[classifier] ✗ ${label} batch ${batchNum} — Claude error: ${claudeErr.message}`);
+      for (const c of batch) {
+        const errEntry = { username: c.username, error: `Claude: ${claudeErr.message}` };
+        errors.push(errEntry);
+        if (job) job.errors.push(errEntry);
+      }
+      if (job) job.progress += batch.length;
+      if (i + CLAUDE_BATCH_SIZE < records.length) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      continue;
+    }
 
-      const updates = results
-        .filter((r) => r && typeof r.index === "number" && batch[r.index])
-        .map((r) => buildUpdate(r, batch[r.index]));
+    const updates = results
+      .filter((r) => r && typeof r.index === "number" && batch[r.index])
+      .map((r) => buildUpdate(r, batch[r.index]));
 
-      if (updates.length > 0) {
-        await updateRecordsBatch(batch[0].base, updates);
+    // ── Step 2: Airtable update ───────────────────────────────────────────────
+    if (updates.length > 0) {
+      try {
+        await doUpdate(batch[0].base, updates);
         processed += updates.length;
         if (job) {
           job.progress += updates.length;
           job.completed.push(
             ...updates.map((u) => ({ username: u._username, profileType: u.profileType }))
           );
-          // Store change history
           for (const u of updates) {
             job.changes.push({
               username: u._username,
@@ -195,24 +225,28 @@ async function processBatchLoop({ records, batchFn, buildUpdate, job, label }) {
           }
         }
         console.log(`[classifier] ✓ ${label} batch ${batchNum}: ${updates.length} done`);
-      }
-
-      // Any contacts missing from Claude's response
-      if (updates.length < batch.length) {
-        for (let m = updates.length; m < batch.length; m++) {
-          const c = batch[m];
-          const err = { username: c.username, error: "Missing from batch response" };
-          errors.push(err);
-          if (job) { job.errors.push(err); job.progress++; }
+      } catch (airtableErr) {
+        console.error(
+          `[classifier] ✗ ${label} batch ${batchNum} — Airtable update error: ${airtableErr.message}`,
+          `records: ${updates.map((u) => u._username || u.id).join(", ")}`
+        );
+        for (const u of updates) {
+          const errEntry = { username: u._username, error: `Airtable: ${airtableErr.message}` };
+          errors.push(errEntry);
+          if (job) job.errors.push(errEntry);
         }
+        if (job) job.progress += updates.length;
       }
-    } catch (err) {
-      console.error(`[classifier] ✗ ${label} batch ${batchNum}: ${err.message}`);
-      for (const c of batch) {
-        errors.push({ username: c.username, error: err.message });
-        if (job) job.errors.push({ username: c.username, error: err.message });
+    }
+
+    // Any contacts missing from Claude's response
+    if (updates.length < batch.length) {
+      for (let m = updates.length; m < batch.length; m++) {
+        const c = batch[m];
+        const errEntry = { username: c.username, error: "Missing from batch response" };
+        errors.push(errEntry);
+        if (job) { job.errors.push(errEntry); job.progress++; }
       }
-      if (job) job.progress += batch.length;
     }
 
     // Pause between batches (not after last)
@@ -325,11 +359,12 @@ async function runGenerateTemplates(artist, batchSize, job = null) {
     batchFn: (batch) => generateTemplatesBatch(client, batch, artist),
     buildUpdate: (r, c) => ({
       id:          c.recordId,
-      profileType: c.profileType,       // keep existing type
+      profileType: c.profileType,       // kept for job.changes tracking only
       template:    r.template || "",
       _username:   c.username,
-      _oldType:    c.profileType,       // same — type unchanged
+      _oldType:    c.profileType,
     }),
+    updateFn: updateTemplatesOnlyBatch,  // only writes template + follow_up (not profile type)
     job,
     label: "templates",
   });
